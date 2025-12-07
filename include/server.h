@@ -13,18 +13,4 @@ typedef struct methods_alowed_s
     const char *methods[METHOD_COUNT];
 }methods_alowed_t;
 
-methods_alowed_t methods_allowed_cheatTable[] = {
-    {
-        "data.txt", 
-        {
-            [GET]     = "GET",
-            [POST]    = "POST",
-            [HEAD]    = NULL,
-            [PUT]     = NULL,
-            [DELETE]  = NULL,
-            [CONNECT] = NULL,
-            [OPTIONS] = NULL,
-            [TRACE]   = NULL
-        }
-    },
-};
+extern methods_alowed_t methods_allowed_cheatTable[];

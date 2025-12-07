@@ -1,7 +1,7 @@
+#include <stdint.h>
 #include <stdio.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <errno.h>
 #include <stdlib.h>
 #include <pthread.h>
 #include <regex.h>
@@ -9,12 +9,28 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include "server.h"
+#include "../include/server.h"
 
 #define PORT 8080
 #define BUFFER_SIZE         1000000
 #define STATUS_LINE_SIZE    50
 #define RESPONSE_BODY_SIZE  500
+
+methods_alowed_t methods_allowed_cheatTable[] = {
+    {
+        "data.txt", 
+        {
+            [GET]     = "GET",
+            [POST]    = "POST",
+            [HEAD]    = NULL,
+            [PUT]     = NULL,
+            [DELETE]  = NULL,
+            [CONNECT] = NULL,
+            [OPTIONS] = NULL,
+            [TRACE]   = NULL
+        }
+    },
+};
 
 char *strstrcpy(const char *src, size_t length)
 {
@@ -43,7 +59,7 @@ void lowercase(char *string, size_t length)
     }
 }
 
-http_error_code http_parse_message(const char *message, http_message_t *parsed_message)
+http_error_code http_parse_message(const char *message, size_t message_size, http_message_t *parsed_message)
 {
     if (message == NULL || parsed_message == NULL)
         return Internal_Server_Error;
@@ -156,8 +172,19 @@ http_error_code http_parse_message(const char *message, http_message_t *parsed_m
     }
 
     parsed_message->fields = headers_table;
-    parsed_message->content = end_pos+2;
 
+    Entry_t *content_length = hash_search_table(parsed_message->fields, "content-length");
+    if (content_length != NULL)
+    {
+        if ((end_pos+2-message) == message_size)
+        {
+            /* The user must try to receive another packet with recv() in the attempt to fetch the content */
+            http_error = No_Content;
+        }
+
+        parsed_message->content = strstrcpy( end_pos+2, atoi(content_length->value));
+    }
+    
 cleanup:
     for (int i = 0; i < current_headers; i++)
     {
@@ -183,6 +210,7 @@ http_error_code http_validate_message(http_message_t *parsed_message)
     /* Check target resource */
 
     char *target_resource = parsed_message->request_line.target_resource;
+    printf("Target Resource: %s\n", target_resource);
 
     FILE *file_fd = fopen(target_resource, "r");
 
@@ -419,16 +447,42 @@ void *handle_client(void *arg)
 
         http_message_t *parsed_message = malloc(sizeof(http_message_t));
 
-        http_error_code http_error = http_parse_message(message, parsed_message);
+        http_error_code http_error = http_parse_message(message, bytes_received, parsed_message);
 
-        if(http_error == Ok)
+        if (http_error == Ok)
+        {
             http_error = http_validate_message(parsed_message);
+
+        }else if(http_error == No_Content)
+        {
+            Entry_t *content_length_header = hash_search_table(parsed_message->fields, "content-length");
+            uint32_t content_length = atoi(content_length_header->value);
+            uint32_t total_bytes_rcv = 0;
+
+            do {
+                bytes_received = recv(client_fd, message,content_length, 0);
+                total_bytes_rcv += bytes_received;
+            }while (bytes_received!=0 && total_bytes_rcv<content_length);
+            
+            if(total_bytes_rcv != content_length)
+            {
+                http_error = Bad_Request;
+            }else
+            {
+                parsed_message->content = strstrcpy(message, content_length);
+                printf("Content:\n%s\n", parsed_message->content);
+                http_error = http_validate_message(parsed_message);
+            }
+        }else
+        {
+            printf("Http error not expected\n");
+        }
 
         const char *response = http_build_response(http_error, parsed_message);
         size_t response_len = strlen(response);
 
         ssize_t bytes_sent = send(client_fd, response, response_len, 0);
-        printf("Sent %ld bytes\n", bytes_sent);
+        printf("Sent: %ld bytes\n%s\n", bytes_sent, response);
 
         free(parsed_message);
         free((void *)response);        

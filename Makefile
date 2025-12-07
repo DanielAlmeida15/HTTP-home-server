@@ -6,8 +6,8 @@ CFLAGS = -Wall -Iinclude
 SRC_DIR = src
 BIN_DIR = bin
 
-SRCS = $(wildcard $(SRC_DIR/*.c))
-OBJS = $(SRCS:$(SRC_DIR/%.c=$(BIN_DIR/%.o)))
+SRCS = $(wildcard $(SRC_DIR)/*.c)
+OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BIN_DIR)/%.o)
 TARGET = $(BIN_DIR)/server
 
 all: $(TARGET)
