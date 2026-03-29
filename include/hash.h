@@ -39,7 +39,7 @@ typedef struct HashTable_s {
  * 
  * @return The pointer to the new hash table
  */
-HashTable_t *hash_create_table(int capacity);
+HashTable_t *hash_create_table(unsigned int capacity);
 
 /**
  * @brief Deletes the hash table

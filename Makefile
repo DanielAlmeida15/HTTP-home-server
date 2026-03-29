@@ -13,7 +13,7 @@ TARGET = $(BIN_DIR)/server
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) $(OBJS) -o $(TARGET)
+	$(CC) $(CFLAGS) $(OBJS) -o $(TARGET) -lpthread
 	rm -rf $(BIN_DIR)/*.o
 
 $(BIN_DIR)/%.o: $(SRC_DIR)/%.c

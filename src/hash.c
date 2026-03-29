@@ -1,12 +1,14 @@
-#include "hash.h"
+#include "../include/hash.h"
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
+#include <unistd.h>
 
 static const char *set_value(const char *value)
 {
-    char *new_value = malloc(sizeof(char)*strlen(value));
-    memcpy(new_value, value, strlen(value)); 
+    size_t len = strlen(value);
+    char *new_value = malloc(sizeof(char) * (len + 1));
+    memcpy(new_value, value, len);
+    new_value[len] = '\0';
 
     return (const char *) new_value;
 }
@@ -42,8 +44,10 @@ unsigned int hash_index(const char *key, int capacity)
     return hash(key) % capacity;
 }
 
-HashTable_t *hash_create_table(int capacity)
+HashTable_t *hash_create_table(unsigned int capacity)
 {
+    if(capacity <= 0) return NULL;
+
     HashTable_t *table = malloc(sizeof(HashTable_t));
     if(table == NULL) return NULL;
 
@@ -67,18 +71,25 @@ HashTable_t *hash_create_table(int capacity)
 
 void hash_free_table(HashTable_t *table)
 {
+    if (table == NULL) return;
+
+    Entry_t *entry = NULL;
+    Entry_t *next  = NULL;
+
     for (int i = 0; i < table->capacity; i++)
     {
-        Entry_t *entry = table->buckets[i];
+        entry = table->buckets[i];
         while (entry != NULL)
         {
-            Entry_t *next = entry->next;
+            next = entry->next;
             free((void *)entry->key);
             free((void *)entry->value);
             free(entry);
             entry = next;
         }
     }
+
+    free(table->buckets);
     free(table);
 }
 
@@ -121,7 +132,7 @@ static void resize_table(HashTable_t *table)
 Entry_t *hash_search_table(HashTable_t *table, const char *key)
 {
     unsigned int index = hash_index(key, table->capacity);
-    Entry_t *entry = table->buckets[index], *prev_entry = NULL;
+    Entry_t *entry = table->buckets[index];
 
     while (entry != NULL)
     {
@@ -129,84 +140,78 @@ Entry_t *hash_search_table(HashTable_t *table, const char *key)
         {
             return entry;
         }
-        prev_entry = entry;
         entry = entry->next;
     }
 
-    return prev_entry;
+    return NULL;
 }
 
 hash_error hash_insert_entry(HashTable_t *table, const char *key, const char *value, ConflictFlags flag)
 {
     if (key == NULL || table == NULL)
         return INVALID_PARAMS;
-    
-    Entry_t *entry = hash_search_table(table, key);
 
-    if (entry != NULL)
+    Entry_t *found = hash_search_table(table, key);
+
+    if (found != NULL)
     {
-        if (strcmp(entry->key, key) == 0)
+        switch (flag)
         {
-            switch (flag)
-            {
-            case REJECT:
-                return ENTRY_REJECTED;
-            case UPDATE_VALUE:
-                free((void *)entry->value);
-                entry->value = set_value(value);
-                return ENTRY_UPDATED;
-            default:
-                return UNKNOWN_FLAG;
-            }
-
-        }else
-        {
-            Entry_t *new_entry = malloc(sizeof(Entry_t));
-            new_entry->key = set_value(key);
-            new_entry->value = (value == NULL) ? NULL : set_value(value);
-            new_entry->next = NULL;
-
-            entry->next = new_entry;
+        case REJECT:
+            return ENTRY_REJECTED;
+        case UPDATE_VALUE:
+            free((void *)found->value);
+            found->value = set_value(value);
+            return ENTRY_UPDATED;
+        default:
+            return UNKNOWN_FLAG;
         }
-    }else
-    {
-        entry = malloc(sizeof(Entry_t));
-        entry->key = set_value(key);
-        entry->value = (value == NULL) ? NULL : set_value(value);
-        entry->next = NULL;
-
-        if (((float)(table->stored + 1) / table->capacity) > LOAD_FACTOR_THRESHOLD)
-        {
-            resize_table(table);
-        }
-
-        unsigned int index = hash_index(key, table->capacity);
-        table->buckets[index] = entry;
-        table->stored++;
     }
+
+    Entry_t *new_entry = malloc(sizeof(Entry_t));
+    if (new_entry == NULL)
+        return INVALID_PARAMS;
+    new_entry->key = set_value(key);
+    new_entry->value = (value == NULL) ? NULL : set_value(value);
+
+    if (((float)(table->stored + 1) / table->capacity) > LOAD_FACTOR_THRESHOLD)
+        resize_table(table);
+
+    unsigned int index = hash_index(key, table->capacity);
+    new_entry->next = table->buckets[index];
+    table->buckets[index] = new_entry;
+    table->stored++;
 
     return HASH_OK;
 }
 
 hash_error hash_delete_entry(HashTable_t *table, const char *key)
 {
+    if (key == NULL || table == NULL)
+        return INVALID_PARAMS;
+
     unsigned int index = hash_index(key, table->capacity);
-
-    if (hash_search_table(table, key) == NULL)
-        return ENTRY_NOT_FOUND;
-    
     Entry_t *entry = table->buckets[index];
-    Entry_t *previous_entry = entry;
+    Entry_t *prev = NULL;
 
-    while (entry != previous_entry->next)
-        previous_entry = previous_entry->next;
-    
-    previous_entry->next = entry->next;
+    while (entry != NULL)
+    {
+        if (strcmp(entry->key, key) == 0)
+        {
+            if (prev == NULL)
+                table->buckets[index] = entry->next;
+            else
+                prev->next = entry->next;
 
-    free((void *)entry->key);
-    free((void *)entry->value);
-    free(entry);
-    table->stored--;
+            free((void *)entry->key);
+            free((void *)entry->value);
+            free(entry);
+            table->stored--;
+            return HASH_OK;
+        }
+        prev = entry;
+        entry = entry->next;
+    }
 
-    return HASH_OK;
+    return ENTRY_NOT_FOUND;
 }

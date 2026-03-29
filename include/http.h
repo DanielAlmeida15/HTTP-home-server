@@ -1,7 +1,23 @@
 #ifndef HTTP_H
 #define HTTP_H
 
-#include "hash.h"
+#include "utils.h"
+
+typedef enum {
+    HTML            = 0,
+    TEXT            ,
+    JS              ,
+    CSS             ,
+    JSON            ,
+    PNG             ,
+    SVG             ,
+    WASM            ,
+    OTF             ,
+    BIN             ,
+    MAX_EXTENSION
+}content_type_t;
+
+extern const char *MimeType[MAX_EXTENSION];
 
 typedef enum{
     Continue                      = 100,
@@ -129,25 +145,5 @@ typedef enum {
 #undef X
 
 extern const char * const http_methods_name[METHOD_COUNT];
-
-typedef struct request_line_s
-{
-    char *method;
-    char *target_resource;
-    int hhtp_major_version;
-    int http_minor_version;
-}request_line_t;
-
-typedef struct headers_s
-{
-    char *name;
-    char *value;
-}headers_t;
-
-typedef struct http_message_s {
-    request_line_t  request_line;
-    HashTable_t     *fields;
-    const char      *content;
-}http_message_t;
 
 #endif
