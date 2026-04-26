@@ -7,7 +7,17 @@
 
 #define N_CONNECTIONS   10      /* Number of concurrent connections to be supported */
 
-extern int g_http_debug;
-extern int g_server_debug;
+#include <stdio.h>
+
+typedef enum {
+    LOG_ERROR = 0,
+    LOG_INFO  = 1,
+    LOG_DEBUG = 2
+} log_level_t;
+
+extern log_level_t  g_log_level;
+extern FILE        *g_log_file;
+
+void log_write(log_level_t level, const char *fmt, ...);
 
 #endif // CONFIG_H

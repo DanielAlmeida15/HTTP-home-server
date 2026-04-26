@@ -91,6 +91,7 @@ typedef struct request_line_s
     char    *target_resource;
     uint8_t http_major_version;
     uint8_t http_minor_version;
+    uint8_t method_code;              /* http_methods_code, or METHOD_COUNT if unknown */
 }PACKED request_line_t;
 
 typedef struct http_message_s
@@ -150,6 +151,12 @@ char *method_action(http_message_t *parsed_message, size_t *body_size);
 *
 *   @return     Size of response message in bytes
 */
-size_t http_build_response(http_error_code error, http_message_t *parsed_message, char **response);
+size_t http_build_response(http_error_code error, http_message_t *parsed_message, char **response, int client_fd);
+
+/**
+*   @brief      Release all heap-owned fields of an http_message_t and zero them.
+*               Safe to call repeatedly on the same struct.
+*/
+void http_message_free(http_message_t *message);
 
 #endif // SERVER_H

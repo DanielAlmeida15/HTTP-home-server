@@ -1,4 +1,4 @@
-#include <regex.h>
+#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <fcntl.h>
@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/sendfile.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "../include/server.h"
@@ -37,7 +39,8 @@ int load_resources(const char *config_path)
     if (f == NULL) return -1;
 
     char line[512];
-    size_t count = 0;
+    size_t count    = 0;
+    size_t capacity = 0;
     resource_t *table = NULL;
 
     while (fgets(line, sizeof(line), f))
@@ -50,9 +53,14 @@ int load_resources(const char *config_path)
         int fields = sscanf(line, "%63s %255s %31s %63s %3s", name, filename, ext_str, methods_str, require_body_str);
         if (fields < 4) continue;
 
-        resource_t *tmp = realloc(table, (count + 1) * sizeof(resource_t));
-        if (tmp == NULL) { free(table); fclose(f); return -1; }
-        table = tmp;
+        if (count == capacity)
+        {
+            size_t new_cap = (capacity == 0) ? 8 : capacity * 2;
+            resource_t *tmp = realloc(table, new_cap * sizeof(resource_t));
+            if (tmp == NULL) { free(table); fclose(f); return -1; }
+            table    = tmp;
+            capacity = new_cap;
+        }
 
         strncpy(table[count].name,     name,     sizeof(table[count].name)     - 1);
         table[count].name[sizeof(table[count].name) - 1] = '\0';
@@ -134,21 +142,42 @@ http_error_code http_parse_header(http_message_t *message, const char *field, si
             break;
 
         case HDR_CONNECTION:
-            if(message->headers.connection != NULL) return Bad_Request;
+        {
+            if (message->headers.connection != NULL) return Bad_Request;
+
+            /* Header value is case-insensitive — compare on a lowercased copy. */
+            char *lower = strstrcpy(field, field_size);
+            if (lower == NULL) return Internal_Server_Error;
+            lowercase(lower, field_size);
 
             message->headers.connection = malloc(sizeof(hdr_connection_t));
-            message->headers.connection->keep_alive = (strstr(field, "keep-alive") != NULL) ? TRUE : FALSE;
-            message->headers.connection->upgrade    = (strstr(field, "upgrade")    != NULL) ? TRUE : FALSE;
+            if (message->headers.connection == NULL) { free(lower); return Internal_Server_Error; }
+            message->headers.connection->keep_alive = (strstr(lower, "keep-alive") != NULL) ? TRUE : FALSE;
+            message->headers.connection->upgrade    = (strstr(lower, "upgrade")    != NULL) ? TRUE : FALSE;
+            free(lower);
             break;
+        }
 
         case HDR_CONTENT_LENGTH:
         {
-            if(message->headers.content_length != NULL) return Bad_Request;
+            if (message->headers.content_length != NULL) return Bad_Request;
+
+            /* Reject leading sign/whitespace up front so strtoull can't wrap "-1"
+               into a huge size_t. RFC 7230: Content-Length is 1*DIGIT only. */
+            if (field[0] < '0' || field[0] > '9') return Bad_Request;
+
+            char *end = NULL;
+            errno = 0;
+            unsigned long long val = strtoull(field, &end, 10);
+            if (end == field || *end != '\0' || errno == ERANGE)
+                return Bad_Request;
+            if (val > (unsigned long long)SIZE_MAX)
+                return Content_Too_Large;
 
             message->headers.content_length = malloc(sizeof(size_t));
-            char *end = NULL;
-            *(message->headers.content_length) = strtol(field, &end, 10);
-            if(end == field || (end != NULL && *end != '\0')) return Bad_Request;
+            if (message->headers.content_length == NULL)
+                return Internal_Server_Error;
+            *(message->headers.content_length) = (size_t)val;
             break;
         }
 
@@ -159,18 +188,32 @@ http_error_code http_parse_header(http_message_t *message, const char *field, si
             break;
 
         case HDR_CONTENT_TYPE:
-            if(message->headers.content_type != NULL) return Bad_Request;
+        {
+            if (message->headers.content_type != NULL) return Bad_Request;
 
-            for (int i=0; i<(sizeof(MimeType)/sizeof(char*)); i++)
+            /* Isolate the media-type token: everything up to ';' or whitespace. */
+            size_t type_len = 0;
+            while (field[type_len] != '\0' &&
+                   field[type_len] != ';'  &&
+                   field[type_len] != ' '  &&
+                   field[type_len] != '\t')
+                type_len++;
+
+            for (size_t i = 0; i < MAX_EXTENSION; i++)
             {
-                if(strstr(field, MimeType[i]) != NULL)
-                {
-                    message->headers.content_type = malloc(sizeof(hdr_content_type_t));
-                    message->headers.content_type->content_type = i;
-                    // TODO: parse charset
-                }
+                if (MimeType[i] == NULL) continue;
+                if (strlen(MimeType[i]) != type_len) continue;
+                if (strncmp(field, MimeType[i], type_len) != 0) continue;
+
+                message->headers.content_type = malloc(sizeof(hdr_content_type_t));
+                if (message->headers.content_type == NULL) return Internal_Server_Error;
+                message->headers.content_type->content_type = (content_type_t)i;
+                message->headers.content_type->charset      = NULL;
+                /* TODO: parse charset */
+                break;
             }
             break;
+        }
 
         default:
             break;
@@ -188,58 +231,94 @@ http_error_code http_parse_message(const char *message, size_t message_size, htt
 
     http_error_code http_error = Ok;
 
-    /* Get the request line */
+    /* Parse the request line: METHOD SP /TARGET SP HTTP/D.D CRLF */
 
-    regex_t request_line_regex;
-    regcomp(&request_line_regex, "^([A-Z]+) /([^ ]*) HTTP/([0-9])\\.([0-9])\r\n", REG_EXTENDED);
-    regmatch_t matches[5];
+    const char *p   = message;
+    const char *end = message + message_size;
 
-    if (regexec(&request_line_regex, message, 5, matches, 0) == 0)
+    /* Method: one or more uppercase ASCII letters */
+    const char *method_start = p;
+    while (p < end && *p >= 'A' && *p <= 'Z') p++;
+    if (p == method_start || p >= end || *p != ' ')
     {
-        regfree(&request_line_regex);
-
-        /* Extract method */
-
-        size_t len = matches[1].rm_eo - matches[1].rm_so;
-        parsed_message->request_line.method = strstrcpy((message + matches[1].rm_so), len);
-
-        /* Extract target resource (strip query string) */
-
-        len = matches[2].rm_eo - matches[2].rm_so;
-        parsed_message->request_line.target_resource = strstrcpy((message + matches[2].rm_so), len);
-        char *qs = strchr(parsed_message->request_line.target_resource, '?');
-        if (qs != NULL) *qs = '\0';
-
-        /* Treat bare "/" as "home" so the default page is home.html */
-        if (parsed_message->request_line.target_resource[0] == '\0')
-        {
-            free(parsed_message->request_line.target_resource);
-            parsed_message->request_line.target_resource = strstrcpy("home", 4);
-        }
-        if (g_http_debug)
-            printf("Target Resource: %s\n", parsed_message->request_line.target_resource);
-        /* Extract HTTP version */
-
-        char version[2];
-        version[1] = '\0';
-
-        memcpy(version, (message + matches[3].rm_so), 1);
-        parsed_message->request_line.http_major_version = atoi(version);
-
-        memcpy(version, (message + matches[4].rm_so), 1);
-        parsed_message->request_line.http_minor_version = atoi(version);
-
-    }else
-    {
-        regfree(&request_line_regex);
-        if (g_http_debug) printf("Bad Request Line\n");
+        log_write(LOG_DEBUG, "Bad Request Line (method)\n");
         return Bad_Request;
     }
+    size_t method_len = (size_t)(p - method_start);
+    p++; /* skip SP */
+
+    /* Target: leading '/', then any non-space up to next SP */
+    if (p >= end || *p != '/')
+    {
+        log_write(LOG_DEBUG, "Bad Request Line (target)\n");
+        return Bad_Request;
+    }
+    p++; /* skip leading '/' (not included in captured target) */
+    const char *target_start = p;
+    while (p < end && *p != ' ' && *p != '\r') p++;
+    if (p >= end || *p != ' ')
+    {
+        log_write(LOG_DEBUG, "Bad Request Line (target terminator)\n");
+        return Bad_Request;
+    }
+    size_t target_len = (size_t)(p - target_start);
+    p++; /* skip SP */
+
+    /* Version: literal "HTTP/" D "." D CRLF */
+    if ((size_t)(end - p) < 8 || memcmp(p, "HTTP/", 5) != 0)
+    {
+        log_write(LOG_DEBUG, "Bad Request Line (version prefix)\n");
+        return Bad_Request;
+    }
+    p += 5;
+    if (p[0] < '0' || p[0] > '9' || p[1] != '.' || p[2] < '0' || p[2] > '9')
+    {
+        log_write(LOG_DEBUG, "Bad Request Line (version digits)\n");
+        return Bad_Request;
+    }
+    uint8_t major = (uint8_t)(p[0] - '0');
+    uint8_t minor = (uint8_t)(p[2] - '0');
+    p += 3;
+    if ((size_t)(end - p) < 2 || p[0] != '\r' || p[1] != '\n')
+    {
+        log_write(LOG_DEBUG, "Bad Request Line (CRLF)\n");
+        return Bad_Request;
+    }
+    p += 2;
+
+    parsed_message->request_line.method              = strstrcpy(method_start, method_len);
+    parsed_message->request_line.target_resource    = strstrcpy(target_start, target_len);
+    parsed_message->request_line.http_major_version = major;
+    parsed_message->request_line.http_minor_version = minor;
+
+    /* Resolve the method to an enum index once — validate/action both use it. */
+    parsed_message->request_line.method_code = METHOD_COUNT;
+    for (uint8_t j = 0; j < METHOD_COUNT; j++)
+    {
+        if (strlen(http_methods_name[j]) == method_len &&
+            memcmp(method_start, http_methods_name[j], method_len) == 0)
+        {
+            parsed_message->request_line.method_code = j;
+            break;
+        }
+    }
+
+    /* Strip query string */
+    char *qs = strchr(parsed_message->request_line.target_resource, '?');
+    if (qs != NULL) *qs = '\0';
+
+    /* Treat bare "/" as "home" so the default page is home.html */
+    if (parsed_message->request_line.target_resource[0] == '\0')
+    {
+        free(parsed_message->request_line.target_resource);
+        parsed_message->request_line.target_resource = strstrcpy("home", 4);
+    }
+    log_write(LOG_DEBUG, "Target Resource: %s\n", parsed_message->request_line.target_resource);
 
     /* Get and parse headers */
 
     int header_length = 0, subString_length = 0;
-    const char *init_pos = message + matches[0].rm_eo, *end_pos = NULL, delimiter = ':', *delimiter_pos = NULL;
+    const char *init_pos = p, *end_pos = NULL, delimiter = ':', *delimiter_pos = NULL;
     char header[256];
 
     while (1)
@@ -248,7 +327,7 @@ http_error_code http_parse_message(const char *message, size_t message_size, htt
 
         if(end_pos == NULL)
         {
-            if (g_http_debug) printf("Didn't find CRLF at the end of line\n");
+            log_write(LOG_DEBUG, "Didn't find CRLF at the end of line\n");
             http_error = Bad_Request;
             goto cleanup;
 
@@ -258,10 +337,10 @@ http_error_code http_parse_message(const char *message, size_t message_size, htt
         }
 
         header_length = end_pos-init_pos;
-        if (header_length > 256)
+        if ((size_t)header_length >= sizeof(header))
         {
-            if (g_http_debug) printf("Header length higher than the size supported\n");
-            http_error = Internal_Server_Error;
+            log_write(LOG_DEBUG, "Header length higher than the size supported\n");
+            http_error = Bad_Request;
             goto cleanup;
         }
         memcpy(header, init_pos, header_length);
@@ -271,7 +350,7 @@ http_error_code http_parse_message(const char *message, size_t message_size, htt
 
         if (delimiter_pos == NULL)
         {
-            if (g_http_debug) printf("Didn't find %c in %s\n", delimiter, header);
+            log_write(LOG_DEBUG, "Didn't find %c in %s\n", delimiter, header);
             http_error = Bad_Request;
             goto cleanup;
         }
@@ -305,18 +384,27 @@ http_error_code http_parse_message(const char *message, size_t message_size, htt
     if (parsed_message->headers.content_length != NULL &&
         *(parsed_message->headers.content_length) > 0)
     {
-        if ((end_pos+2-message) == (ptrdiff_t)message_size)
+        const char *body_start = end_pos + 2;
+        size_t body_present    = (size_t)((message + message_size) - body_start);
+        size_t content_len     = *(parsed_message->headers.content_length);
+
+        if (body_present >= content_len)
         {
-            /* Body hasn't arrived yet — caller must fetch it with another recv() */
-            http_error = No_Content;
+            parsed_message->content = strstrcpy(body_start, content_len);
         }
         else
         {
-            parsed_message->content = strstrcpy(end_pos+2, *(parsed_message->headers.content_length));
+            /* Full body not here yet — caller must recv() the remaining bytes
+               into the buffer (continuing at message + message_size). */
+            http_error = No_Content;
         }
     }
 
 cleanup:
+    /* Release partial allocations on any error path except No_Content
+       (No_Content means the caller will finish the read and retry). */
+    if (http_error != Ok && http_error != No_Content)
+        http_message_free(parsed_message);
     return http_error;
 }
 
@@ -331,16 +419,10 @@ http_error_code http_validate_message(http_message_t *parsed_message)
     
     /* Check target resource existence, method and if present content type */
 
-    /* Compute method bitmask once */
-    uint8_t method_bit = 0;
-    for (int j = 0; j < METHOD_COUNT; j++)
-    {
-        if (strcmp(parsed_message->request_line.method, http_methods_name[j]) == 0)
-        {
-            method_bit = (uint8_t)(1 << j);
-            break;
-        }
-    }
+    /* Method index was resolved in http_parse_message. */
+    uint8_t method_bit = (parsed_message->request_line.method_code < METHOD_COUNT)
+                         ? (uint8_t)(1 << parsed_message->request_line.method_code)
+                         : 0;
 
     http_error_code error = Not_Found;
 
@@ -352,7 +434,7 @@ http_error_code http_validate_message(http_message_t *parsed_message)
 
         parsed_message->resource_id = i;
 
-        if (strcmp(parsed_message->request_line.method, "POST") == 0)
+        if (parsed_message->request_line.method_code == POST)
         {
             if (parsed_message->headers.content_type != NULL &&
                 parsed_message->headers.content_type->content_type != g_resources[i].extension)
@@ -369,15 +451,25 @@ http_error_code http_validate_message(http_message_t *parsed_message)
     /* Pass 2: directory prefix match */
     if (error == Not_Found)
     {
+        const char *target = parsed_message->request_line.target_resource;
+
         for (int i = 0; i < (int)g_resource_count; i++)
         {
             if (!g_resources[i].is_directory) continue;
 
-            /* "." means root — matches every path */
-            int match = (strcmp(g_resources[i].name, ".") == 0) ? 1
-                      : (strncmp(parsed_message->request_line.target_resource,
-                                 g_resources[i].name,
-                                 strlen(g_resources[i].name)) == 0);
+            int match;
+            if (strcmp(g_resources[i].name, ".") == 0)
+            {
+                /* "." means root — matches every path */
+                match = 1;
+            }
+            else
+            {
+                size_t name_len = strlen(g_resources[i].name);
+                /* Prefix must end at a component boundary: end-of-string or '/'. */
+                match = (strncmp(target, g_resources[i].name, name_len) == 0) &&
+                        (target[name_len] == '\0' || target[name_len] == '/');
+            }
             if (!match) continue;
 
             parsed_message->resource_id = i;
@@ -399,7 +491,7 @@ http_error_code http_validate_message(http_message_t *parsed_message)
 
     /* Reject body-less POST if resource requires one */
     if (g_resources[parsed_message->resource_id].require_body &&
-        strcmp(parsed_message->request_line.method, "POST") == 0 &&
+        parsed_message->request_line.method_code == POST &&
         (parsed_message->headers.content_length == NULL ||
          *(parsed_message->headers.content_length) == 0))
         return Bad_Request;
@@ -407,104 +499,115 @@ http_error_code http_validate_message(http_message_t *parsed_message)
     return Ok;
 }
 
+/* Stream a GET response directly to the client via send() + sendfile().
+   Returns 1 on success, 0 on any failure (caller falls back to 500). */
+static int http_send_get(http_message_t *parsed_message, int client_fd)
+{
+    resource_t *res = &g_resources[parsed_message->resource_id];
+
+    /* Resolve path and MIME type */
+    const char *open_path;
+    content_type_t mime;
+    char dir_path[512];
+
+    if (res->is_directory)
+    {
+        size_t prefix_len = (strcmp(res->name, ".") == 0) ? 0 : strlen(res->name);
+        const char *suffix = parsed_message->request_line.target_resource + prefix_len;
+        if (*suffix == '\0' || strcmp(suffix, "/") == 0) suffix = "/index.html";
+
+        /* Reject path traversal: any component that is literally ".." */
+        const char *c = suffix;
+        while (*c != '\0')
+        {
+            if (*c == '/') c++;
+            const char *seg = c;
+            while (*c != '\0' && *c != '/') c++;
+            size_t seg_len = (size_t)(c - seg);
+            if (seg_len == 2 && seg[0] == '.' && seg[1] == '.') return 0;
+        }
+
+        if (*suffix == '/') suffix++;
+        snprintf(dir_path, sizeof(dir_path), "%s%s", res->filename, suffix);
+        open_path = dir_path;
+        mime      = content_type_from_path(suffix);
+    }
+    else
+    {
+        open_path = res->filename;
+        mime      = res->extension;
+    }
+
+    log_write(LOG_DEBUG, "Serving: %s  MIME: %s\n", open_path, MimeType[mime]);
+
+    pthread_rwlock_rdlock(&res->rwlock);
+
+    int file_fd = open(open_path, O_RDONLY);
+    if (file_fd < 0)
+    {
+        log_write(LOG_ERROR, "%s: %s\n", open_path, strerror(errno));
+        pthread_rwlock_unlock(&res->rwlock);
+        return 0;
+    }
+
+    struct stat st;
+    if (fstat(file_fd, &st) != 0 || !S_ISREG(st.st_mode))
+    {
+        close(file_fd);
+        pthread_rwlock_unlock(&res->rwlock);
+        return 0;
+    }
+    off_t file_size = st.st_size;
+
+    hdr_connection_t *conn = parsed_message->headers.connection;
+    char head[512];
+    int hlen = snprintf(head, sizeof(head),
+                        "HTTP/1.1 200 Ok\r\n"
+                        "content-Type: %s\r\n"
+                        "content-Length: %lld\r\n"
+                        "connection: %s\r\n"
+                        "\r\n",
+                        MimeType[mime],
+                        (long long)file_size,
+                        (conn != NULL && conn->keep_alive) ? "keep-alive" : "close");
+    if (hlen < 0 || hlen >= (int)sizeof(head))
+    {
+        close(file_fd);
+        pthread_rwlock_unlock(&res->rwlock);
+        return 0;
+    }
+
+    /* Send headers */
+    size_t head_sent = 0;
+    while (head_sent < (size_t)hlen)
+    {
+        ssize_t n = send(client_fd, head + head_sent, (size_t)hlen - head_sent, MSG_NOSIGNAL);
+        if (n <= 0) { close(file_fd); pthread_rwlock_unlock(&res->rwlock); return 0; }
+        head_sent += (size_t)n;
+    }
+
+    /* Stream body via sendfile — no userspace copy. */
+    off_t offset = 0;
+    while (offset < file_size)
+    {
+        ssize_t n = sendfile(client_fd, file_fd, &offset, (size_t)(file_size - offset));
+        if (n <= 0) { close(file_fd); pthread_rwlock_unlock(&res->rwlock); return 0; }
+    }
+
+    close(file_fd);
+    pthread_rwlock_unlock(&res->rwlock);
+    return 1;
+}
+
 char *method_action(http_message_t *parsed_message, size_t *body_size)
 {
     if (parsed_message == NULL || body_size == NULL) return NULL;
 
-    uint8_t method_code = METHOD_COUNT;
-    for (int i = 0; i < METHOD_COUNT; i++)
-    {
-        if (strcmp(http_methods_name[i], parsed_message->request_line.method) == 0)
-        {
-            method_code = i;
-            break;
-        }
-    }
-
+    uint8_t method_code = parsed_message->request_line.method_code;
     resource_t *res = &g_resources[parsed_message->resource_id];
 
     switch (method_code)
     {
-    case GET:
-    {
-        /* Resolve the path and MIME type */
-        const char *open_path;
-        content_type_t mime;
-        char dir_path[512];
-
-        if (res->is_directory)
-        {
-            size_t prefix_len = (strcmp(res->name, ".") == 0) ? 0 : strlen(res->name);
-            const char *suffix = parsed_message->request_line.target_resource + prefix_len;
-            if (*suffix == '\0' || strcmp(suffix, "/") == 0) suffix = "/index.html";
-
-            /* Reject path traversal */
-            if (strstr(suffix, "..") != NULL) return NULL;
-
-            if (*suffix == '/') suffix++;
-            snprintf(dir_path, sizeof(dir_path), "%s%s", res->filename, suffix);
-            open_path = dir_path;
-            mime      = content_type_from_path(suffix);
-        }
-        else
-        {
-            open_path = res->filename;
-            mime      = res->extension;
-        }
-
-        if (g_server_debug)
-            printf("Serving: %s  MIME: %s\n", open_path, MimeType[mime]);
-
-        pthread_rwlock_rdlock(&res->rwlock);
-
-        FILE *file_fd = fopen(open_path, "rb");
-        if (file_fd == NULL)
-        {
-            perror(open_path);
-            pthread_rwlock_unlock(&res->rwlock);
-            return NULL;
-        }
-
-        if (fseek(file_fd, 0, SEEK_END) != 0) { fclose(file_fd); pthread_rwlock_unlock(&res->rwlock); return NULL; }
-        long file_size = ftell(file_fd);
-        if (file_size < 0) { fclose(file_fd); pthread_rwlock_unlock(&res->rwlock); return NULL; }
-        rewind(file_fd);
-
-        char *file_data = malloc((size_t)file_size);
-        if (file_data == NULL) { fclose(file_fd); pthread_rwlock_unlock(&res->rwlock); return NULL; }
-
-        if (fread(file_data, 1, (size_t)file_size, file_fd) != (size_t)file_size)
-        {
-            free(file_data); fclose(file_fd); pthread_rwlock_unlock(&res->rwlock); return NULL;
-        }
-        fclose(file_fd);
-        pthread_rwlock_unlock(&res->rwlock);
-
-        hdr_connection_t *conn = parsed_message->headers.connection;
-        char headers[512];
-        int hlen = snprintf(headers, sizeof(headers),
-                            "content-Type: %s\r\n"
-                            "content-Length: %ld\r\n"
-                            "connection: %s\r\n"
-                            "\r\n",
-                            MimeType[mime],
-                            file_size,
-                            (conn != NULL && conn->keep_alive) ? "keep-alive" : "close");
-
-        if (hlen < 0 || hlen >= (int)sizeof(headers)) { free(file_data); return NULL; }
-
-        size_t total = (size_t)hlen + (size_t)file_size;
-        char *body = malloc(total);
-        if (body == NULL) { free(file_data); return NULL; }
-
-        memcpy(body,         headers,   (size_t)hlen);
-        memcpy(body + hlen,  file_data, (size_t)file_size);
-        free(file_data);
-
-        *body_size = total;
-        return body;
-    }
-
     case POST:
     {
         pthread_rwlock_wrlock(&res->rwlock);
@@ -540,7 +643,7 @@ char *method_action(http_message_t *parsed_message, size_t *body_size)
     }
 }
 
-size_t http_build_response(http_error_code error, http_message_t *parsed_message, char **response)
+size_t http_build_response(http_error_code error, http_message_t *parsed_message, char **response, int client_fd)
 {
     static const char hvsb[] = "Content-Type: text/plain\r\n"
                                "Content-Length: 28\r\n"
@@ -560,10 +663,23 @@ size_t http_build_response(http_error_code error, http_message_t *parsed_message
         break;
 
     case Ok:
+        /* GET streams its own status line + headers + body via sendfile.
+           If it succeeds, there's nothing left for us to send. */
+        if (parsed_message->request_line.method_code == GET)
+        {
+            if (http_send_get(parsed_message, client_fd))
+            {
+                *response = NULL;
+                return 0;
+            }
+            error = Internal_Server_Error;
+            goto build_error_body;
+        }
         body_data = method_action(parsed_message, &body_size);
         if (body_data != NULL) break;
         error = Internal_Server_Error;
         /* fallthrough */
+    build_error_body:
     case Bad_Request:
     case Not_Found:
     case Method_Not_Allowed:
@@ -586,12 +702,9 @@ size_t http_build_response(http_error_code error, http_message_t *parsed_message
 
     size_t response_size = (size_t)slen + body_size;
 
-    if (g_http_debug)
-    {
-        printf("Response status line size: %d\n", slen);
-        printf("Response body size: %zu\n", body_size);
-        printf("Response size: %zu\n", response_size);
-    }
+    log_write(LOG_DEBUG, "Response status line size: %d\n", slen);
+    log_write(LOG_DEBUG, "Response body size: %zu\n", body_size);
+    log_write(LOG_DEBUG, "Response size: %zu\n", response_size);
 
     *response = malloc(response_size + 1);
     if (*response == NULL) { free(body_data); return 0; }
@@ -602,4 +715,40 @@ size_t http_build_response(http_error_code error, http_message_t *parsed_message
     free(body_data);
 
     return response_size;
+}
+
+void http_message_free(http_message_t *message)
+{
+    if (message == NULL) return;
+
+    free(message->request_line.method);
+    free(message->request_line.target_resource);
+    message->request_line.method          = NULL;
+    message->request_line.target_resource = NULL;
+
+    free(message->headers.host);
+    free(message->headers.connection);
+    free(message->headers.content_length);
+    free(message->headers.user_agent);
+    if (message->headers.content_type != NULL)
+    {
+        free(message->headers.content_type->charset);
+        free(message->headers.content_type);
+    }
+    free(message->headers.accept_enconding);
+    free(message->headers.accept_language);
+    free(message->headers.accept);
+    free(message->headers.origin);
+    message->headers.host             = NULL;
+    message->headers.connection       = NULL;
+    message->headers.content_length   = NULL;
+    message->headers.user_agent       = NULL;
+    message->headers.content_type     = NULL;
+    message->headers.accept_enconding = NULL;
+    message->headers.accept_language  = NULL;
+    message->headers.accept           = NULL;
+    message->headers.origin           = NULL;
+
+    free((void *)message->content);
+    message->content = NULL;
 }

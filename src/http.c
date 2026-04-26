@@ -24,9 +24,10 @@ const char * const http_methods_name[METHOD_COUNT] = {HTTP_METHODS};
 
 const char *get_http_error_name(int code)
 {
-    for (int i = 0; i < sizeof(http_errors) / sizeof(http_error_t); i++) {
-        if (http_errors[i].code == code)
-            return http_errors[i].name;
+    switch (code) {
+#define X(name, value) case value: return #name;
+        HTTP_ERRORS
+#undef X
+        default: return "UNKNOWN_ERROR";
     }
-    return "UNKNOWN_ERROR";
 }
